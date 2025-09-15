@@ -106,7 +106,7 @@ static int oria_wa150km_decode(r_device *decoder, bitbuffer_t *bitbuffer)
             "model",        "", DATA_STRING, "Oria-WA150KM",
             "id",           "", DATA_INT,    device_id,
             "channel",      "", DATA_INT,    channel,
-            "temperature",  "", DATA_FORMAT, "%.1f C", DATA_DOUBLE, temperature,
+            "temperature_C",  "", DATA_FORMAT, "%.1f C", DATA_DOUBLE, temperature,
             NULL);
     /* clang-format on */
     decoder_output_data(decoder, data);
@@ -125,7 +125,7 @@ static char const *const output_fields[] = {
         "model",
         "id",
         "channel",
-        "temperature",
+        "temperature_C",
         NULL,
 };
 
