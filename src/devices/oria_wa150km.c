@@ -38,9 +38,24 @@ Observations currently not affecting implemetation:
  */
 
 #include "decoder.h"
+#include <math.h>
 
 #define ORIA_WA150KM_BITLEN  227
 #define WARMUP_LEN           3  // number of 0xff bytes at start
+#define MAX_DEVICES          32  // maximum number of devices to track
+#define MAX_TEMP_DELTA       12.0f  // maximum temperature change in °C between readings
+
+// Structure to track state for each device (identified by device_id + channel)
+typedef struct {
+    uint8_t device_id;
+    uint8_t channel;
+    float last_temperature;
+    int initialized;  // 0 = not initialized, 1 = has valid previous reading
+} device_state_t;
+
+// Static array to track device states
+static device_state_t device_states[MAX_DEVICES];
+static int device_states_initialized = 0;
 
 static int oria_wa150km_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 {
@@ -87,19 +102,108 @@ static int oria_wa150km_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 
     b = manchester_buffer.bb[0];
 
+    // Sanity check: verify last byte is 0x65 (fixed value per protocol)
+    if (b[13] != 0x65) {
+        decoder_logf(decoder, 1, __func__, "Last byte is not 0x65: 0x%02x (might indicate corrupted data)", b[13]);
+        return DECODE_FAIL_SANITY;
+    }
+
     // Extract channel (upper nibble + 1)
     uint8_t channel = ((b[5] >> 4) & 0x0F) + 1;
 
     // Extract device ID
     uint8_t device_id = b[6];
 
+    // Sanity check: validate channel range (1-16)
+    if (channel < 1 || channel > 16) {
+        decoder_logf(decoder, 1, __func__, "Channel out of range: %d (expected 1-16)", channel);
+        return DECODE_FAIL_SANITY;
+    }
+
+    // Extract temperature nibbles for validation
+    uint8_t temp_decimal_nibble = (b[7] >> 4) & 0x0F;
+    uint8_t temp_tens_nibble = (b[8] >> 4) & 0x0F;
+    uint8_t temp_ones_nibble = b[8] & 0x0F;
+
+    // Sanity check: validate BCD encoding (each nibble must be 0-9)
+    if (temp_decimal_nibble > 9 || temp_tens_nibble > 9 || temp_ones_nibble > 9) {
+        decoder_logf(decoder, 1, __func__, "Invalid BCD encoding: decimal=%d tens=%d ones=%d",
+                temp_decimal_nibble, temp_tens_nibble, temp_ones_nibble);
+        return DECODE_FAIL_SANITY;
+    }
+
     // Extract temperature
     // BCD: Convert each nibble of byte 8 to decimal (tens+ones) and add decimal from byte 7
-    float temperature = (((b[8] >> 4) & 0x0F) * 10 + (b[8] & 0x0F)) + ((b[7] >> 4) & 0x0F) * 0.1;
+    float temperature = (temp_tens_nibble * 10 + temp_ones_nibble) + temp_decimal_nibble * 0.1;
     // Check sign byte (bit 4)
     if (b[9] & 0x08) {
         temperature = -temperature;
     }
+
+    // Sanity check: validate temperature range for freezer/fridge thermometer
+    // Range: -40°C to 60°C (covers freezer temps down to -40°C and room temp/fridge temps up to 60°C)
+    if (temperature < -40.0f || temperature > 60.0f) {
+        decoder_logf(decoder, 1, __func__, "Temperature out of reasonable range: %.1f°C (expected -40°C to 60°C)", temperature);
+        return DECODE_FAIL_SANITY;
+    }
+
+    // Sanity check: reject suspicious device ID patterns that might indicate corrupted data
+    // All zeros or all ones are suspicious (though technically possible, they're rare)
+    if (device_id == 0x00 || device_id == 0xFF) {
+        decoder_logf(decoder, 2, __func__, "Suspicious device ID: 0x%02x (might indicate corrupted data)", device_id);
+        // Note: This is a warning level check, we'll still accept it if other checks pass
+        // If you want to reject these, change to level 1 and return DECODE_FAIL_SANITY
+    }
+
+    // Initialize device states array if not already done
+    if (!device_states_initialized) {
+        for (int i = 0; i < MAX_DEVICES; i++) {
+            device_states[i].initialized = 0;
+        }
+        device_states_initialized = 1;
+    }
+
+    // Find existing device state or an empty slot
+    int device_index = -1;
+    for (int i = 0; i < MAX_DEVICES; i++) {
+        if (device_states[i].initialized) {
+            if (device_states[i].device_id == device_id && device_states[i].channel == channel) {
+                device_index = i;
+                break;
+            }
+        } else {
+            // Found empty slot, use it for new device
+            if (device_index == -1) {
+                device_index = i;
+            }
+        }
+    }
+
+    // If no slot found (array full), reject to prevent buffer overflow
+    if (device_index == -1) {
+        decoder_logf(decoder, 1, __func__, "Device state tracking full, cannot track device id=0x%02x channel=%d", device_id, channel);
+        return DECODE_FAIL_SANITY;
+    }
+
+    // Check if this device has a previous reading
+    if (device_states[device_index].initialized) {
+        float last_temp = device_states[device_index].last_temperature;
+        float delta = fabsf(temperature - last_temp);
+
+        // Reject if temperature change is too large (likely radio reception issue)
+        if (delta > MAX_TEMP_DELTA) {
+            decoder_logf(decoder, 1, __func__,
+                    "Temperature delta too large: %.1f°C -> %.1f°C (delta=%.1f°C, max=%.1f°C), rejecting",
+                    last_temp, temperature, delta, MAX_TEMP_DELTA);
+            return DECODE_FAIL_SANITY;
+        }
+    }
+
+    // Update device state with new reading
+    device_states[device_index].device_id = device_id;
+    device_states[device_index].channel = channel;
+    device_states[device_index].last_temperature = temperature;
+    device_states[device_index].initialized = 1;
 
     /* clang-format off */
     data = data_make(
